@@ -150,7 +150,7 @@ def _instance_id(owner: str, repo_name: str, pr_number: Any) -> str:
 
 
 def _problem_statement_from_pr(pr: dict[str, Any], max_chars: int = 12000) -> str:
-    """PR title/body plus linked issues (Turing-style task text)."""
+    """PR title/body plus linked issues (task text for classification)."""
     parts: list[str] = []
     title = (pr.get("title") or "").strip()
     body = (pr.get("body") or "").strip()

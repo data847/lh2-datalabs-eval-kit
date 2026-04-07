@@ -1,7 +1,7 @@
 """
 Production quality assessment across multiple repos — clone-based, with optional LLM.
 
-Excludes files authored by turing / pr-sourcing accounts (via git blame).
+Excludes files authored by pr-sourcing accounts (via git blame).
 Only evaluates code written by the original developers.
 
 Supports Python and JavaScript/TypeScript repos (auto-detected per repo).
@@ -353,8 +353,8 @@ def _is_test_file(path: str, root: str) -> bool:
     return any(p in rel for p in ["test", "spec", "__tests__", "tests/", "testing/"])
 
 
-def _is_turing_file(filepath: str, root: str, patterns: list[str]) -> bool:
-    """Return True if >50% of lines are authored by turing-pattern accounts."""
+def _is_sourcing_file(filepath: str, root: str, patterns: list[str]) -> bool:
+    """Return True if >50% of lines are authored by sourcing-pattern accounts."""
     if not patterns:
         return False
     blame = _run_git(["blame", "--porcelain", _rel(filepath, root)], root)
@@ -362,7 +362,7 @@ def _is_turing_file(filepath: str, root: str, patterns: list[str]) -> bool:
         return False
 
     total_lines = 0
-    turing_lines = 0
+    sourcing_lines = 0
     author = ""
     email = ""
 
@@ -372,30 +372,30 @@ def _is_turing_file(filepath: str, root: str, patterns: list[str]) -> bool:
         elif line.startswith("author-mail "):
             email = line[12:].strip().lower().strip("<>")
             combined = f"{author} {email}"
-            is_turing = any(p in combined for p in patterns)
+            is_sourcing = any(p in combined for p in patterns)
             total_lines += 1
-            if is_turing:
-                turing_lines += 1
+            if is_sourcing:
+                sourcing_lines += 1
 
     if total_lines == 0:
         return False
-    return (turing_lines / total_lines) > 0.5
+    return (sourcing_lines / total_lines) > 0.5
 
 
-def _filter_non_turing_files(
+def _filter_non_sourcing_files(
     root: str, files: list[str], patterns: list[str], verbose_log=None
 ) -> list[str]:
     if not patterns:
         return files
     kept, excluded = [], 0
     for f in files:
-        if _is_turing_file(f, root, patterns):
+        if _is_sourcing_file(f, root, patterns):
             excluded += 1
         else:
             kept.append(f)
     if verbose_log and excluded:
         verbose_log(
-            f"      Excluded {excluded} turing-authored files, kept {len(kept)}"
+            f"      Excluded {excluded} sourcing-authored files, kept {len(kept)}"
         )
     return kept
 
@@ -1641,7 +1641,7 @@ def _check_repo(
         "grade": "?",
         "criteria": {},
         "files_analyzed": 0,
-        "files_excluded_turing": 0,
+        "files_excluded_sourcing": 0,
         "error": None,
     }
 
@@ -1687,12 +1687,12 @@ def _check_repo(
         )
 
     files_before = len(all_source)
-    source_files = _filter_non_turing_files(root, all_source, verbose_log)
-    result["files_excluded_turing"] = files_before - len(source_files)
+    source_files = _filter_non_sourcing_files(root, all_source, verbose_log)
+    result["files_excluded_sourcing"] = files_before - len(source_files)
     result["files_analyzed"] = len(source_files)
 
     if not source_files:
-        result["error"] = "all files turing-authored"
+        result["error"] = "all files sourcing-authored"
         if owns_clone:
             shutil.rmtree(clone_dir, ignore_errors=True)
         return result
