@@ -667,6 +667,7 @@ def run_evaluator(
     evaluator_script: str,
     extra_args: List[str],
     output_dir: str,
+    timeout_minutes: int = 120,
 ) -> RunResult:
     """Run repo_evaluator.py for a single repo.
 
@@ -706,7 +707,7 @@ def run_evaluator(
     print(f"  ▶ Running: {repo_full_name} …")
     started = time.time()
     try:
-        completed = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+        completed = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_minutes * 60)
         duration = round(time.time() - started, 1)
         if completed.returncode == 0:
             print(f"  ✅ {repo_full_name}  ({duration}s)")
@@ -725,7 +726,7 @@ def run_evaluator(
         duration = round(time.time() - started, 1)
         print(f"  ⏰ {repo_full_name}  TIMEOUT after {duration}s")
         return RunResult(repo=repo_full_name, exit_code=-1,
-                         duration_seconds=duration, error="timeout (30min)")
+                         duration_seconds=duration, error=f"timeout ({timeout_minutes}min)")
     except Exception as e:
         duration = round(time.time() - started, 1)
         print(f"  💥 {repo_full_name}  ERROR: {e}")
@@ -741,6 +742,7 @@ def run_all(
     output_dir: str,
     workers: int = 4,
     fail_fast: bool = False,
+    timeout_minutes: int = 60,
 ) -> List[RunResult]:
     """Execute repo_evaluator.py on every discovered repo."""
     os.makedirs(output_dir, exist_ok=True)
@@ -749,7 +751,8 @@ def run_all(
     all_repos = [r for repos in org_repos.values() for r in repos]
     total = len(all_repos)
     print(f"\n🚀 Starting evaluation of {total} repos with {workers} worker(s)")
-    print(f"   Output directory: {output_dir}\n")
+    print(f"   Output directory: {output_dir}")
+    print(f"   Timeout per repo: {timeout_minutes} min\n")
 
     results: List[RunResult] = []
 
@@ -757,7 +760,7 @@ def run_all(
         future_map = {
             pool.submit(
                 run_evaluator, r, token, evaluator_script, extra_args,
-                output_dir
+                output_dir, timeout_minutes
             ): r
             for r in all_repos
         }
@@ -963,6 +966,11 @@ How to get a GitLab token:
         help="Stop on first failure",
     )
     p.add_argument(
+        "--timeout", type=int, default=None,
+        help="Timeout in minutes per repo evaluation "
+             "(env: EVAL_TIMEOUT, default: 60)",
+    )
+    p.add_argument(
         "--output-dir", default=None,
         help="Directory for per-repo JSON output "
              "(env: EVAL_OUTPUT_DIR, default: eval_results)",
@@ -1005,6 +1013,7 @@ class ResolvedConfig:
     include_forks: bool
     visibility: str
     workers: int
+    timeout: int
     fail_fast: bool
     output_dir: str
     evaluator_script: str
@@ -1095,6 +1104,9 @@ def resolve_config(args: argparse.Namespace) -> ResolvedConfig:
     workers, sources["workers"] = _resolve(
         args.workers, "EVAL_WORKERS", 4, is_int=True)
 
+    timeout, sources["timeout"] = _resolve(
+        args.timeout, "EVAL_TIMEOUT", 60, is_int=True)
+
     output_dir, sources["output_dir"] = _resolve(
         args.output_dir, "EVAL_OUTPUT_DIR", "eval_results")
 
@@ -1116,6 +1128,7 @@ def resolve_config(args: argparse.Namespace) -> ResolvedConfig:
         include_forks=include_forks,
         visibility=visibility,
         workers=workers,
+        timeout=timeout,
         fail_fast=args.fail_fast,
         output_dir=output_dir,
         evaluator_script=evaluator_script,
@@ -1156,6 +1169,7 @@ def print_config(cfg: ResolvedConfig) -> None:
         ("Include forks", str(cfg.include_forks), cfg.sources.get("include_forks", "")),
         ("Visibility", cfg.visibility, cfg.sources.get("visibility", "")),
         ("Workers", str(cfg.workers), cfg.sources.get("workers", "")),
+        ("Timeout per repo", f"{cfg.timeout} min", cfg.sources.get("timeout", "")),
         ("Output dir", cfg.output_dir, cfg.sources.get("output_dir", "")),
         ("Evaluator script", cfg.evaluator_script, cfg.sources.get("evaluator_script", "")),
         ("Evaluator args", cfg.evaluator_args or "(none)", cfg.sources.get("evaluator_args", "")),
@@ -1328,6 +1342,7 @@ def _finish(cfg: ResolvedConfig, org_repos: Dict[str, List[RepoInfo]]) -> int:
         output_dir=cfg.output_dir,
         workers=cfg.workers,
         fail_fast=cfg.fail_fast,
+        timeout_minutes=cfg.timeout,
     )
 
     print_summary(results, cfg.output_dir)
@@ -1338,6 +1353,17 @@ def _finish(cfg: ResolvedConfig, org_repos: Dict[str, List[RepoInfo]]) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+
+
+
+
+
+
+
+
+
 
 
 

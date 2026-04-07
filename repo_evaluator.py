@@ -3421,7 +3421,7 @@ def clone_repo(
         ["git", "clone", repo_url, str(clone_path)],
         capture_output=True,
         text=True,
-        timeout=300,
+        timeout=900,  # 15 minutes for large repos
     )
 
     if result.returncode != 0:
