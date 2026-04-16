@@ -1,6 +1,6 @@
 # 🔍 Repository Evaluation Kit — User Guide
 
-A simple, step-by-step guide to evaluate your GitHub or GitLab projects. No programming experience required.
+A simple, step-by-step guide to evaluate your **GitHub**, **GitLab**, **Subversion (SVN)**, or **local directory** projects. No programming experience required.
 
 ---
 
@@ -9,12 +9,16 @@ A simple, step-by-step guide to evaluate your GitHub or GitLab projects. No prog
 This tool scans your code projects and generates a **quality report** for each one — covering things like:
 
 - How many files, tests, and lines of code exist
-- How healthy the development process is (commits, pull requests, contributors)
+- How healthy the development process is (commits, pull requests where available, contributors)
 - Whether CI/CD pipelines and test frameworks are set up
 - Whether the code may be AI-generated
 - Whether the project is likely open-source
 
-You can scan **one project at a time**, or **all projects you have access to** in one go.
+You can scan **one project at a time**, **a local folder on your machine**, **many SVN URLs from a list**, or **all GitHub/GitLab projects you have access to** in one go.
+
+> **SVN note:** There is no pull-request API for SVN like on GitHub/GitLab. Reports still include file metrics, tests, CI files, commit history from `svn log`, and optional quality checks — but **pull-request counts and PR-based scores will be empty or zero**.
+
+> **Local directory note:** You can point the evaluator at any folder on your machine — a Git checkout, an SVN working copy, or a plain directory. No clone or remote access is needed. PR metrics will be empty, but file analysis, commit history (if Git/SVN), tests, and CI detection all work normally.
 
 ---
 
@@ -22,7 +26,7 @@ You can scan **one project at a time**, or **all projects you have access to** i
 
 You only need to follow these steps **once** on your computer.
 
-### Step 1 — Check that Python and Git are installed
+### Step 1 — Check that Python and Git are installed (and SVN, if you use it)
 
 Open your **Terminal** app:
 - **Mac**: Press `Cmd + Space`, type `Terminal`, hit Enter
@@ -42,6 +46,14 @@ git --version
 ❌ If either says "not found":
 - Install Python from https://www.python.org/downloads/ (pick 3.10 or higher)
 - Install Git from https://git-scm.com/downloads
+
+**If you will evaluate Subversion (SVN) repositories**, also run:
+
+```
+svn --version
+```
+
+If that fails, install the **Apache Subversion command-line client** (on Mac with Homebrew: `brew install subversion`; on Windows, see [Apache Subversion packages](https://subversion.apache.org/packages.html) or ask your IT team).
 
 ### Step 2 — Download this tool
 
@@ -102,6 +114,15 @@ A token is like a special password that lets this tool read your projects.
 4. Click **"Create personal access token"**
 5. **Copy the token right away** (starts with `glpat-`)
 
+#### If your projects are in **Subversion (SVN)**:
+
+SVN servers usually ask for a **username and password** (not a Git-style API token). The evaluator uses:
+
+- **`--svn-username`** (or the `SVN_USERNAME` environment variable) for your login name
+- **`--token`** for your password *(yes, the same flag name as other platforms)*, or set `SVN_PASSWORD` / `TOKEN` when using the bulk script
+
+Your server administrator can tell you the correct repository URL (often ends in `/trunk` or another branch path).
+
 ### Step 5 — Save your token
 
 This way you won't have to paste it every time you run the tool.
@@ -117,6 +138,19 @@ echo "GITHUB_TOKEN=ghp_PASTE_YOUR_TOKEN_HERE" > .env
 ```
 echo "GITLAB_TOKEN=glpat-PASTE_YOUR_TOKEN_HERE" > .env
 ```
+
+
+
+**SVN users** (optional — you can pass username and password on the command line instead):
+
+Open or create the `.env` file in a text editor and add:
+
+```
+SVN_USERNAME=my_username
+SVN_PASSWORD=my_password
+```
+
+The bulk SVN script also accepts the `TOKEN` environment variable as the password. Do **not** commit or share your `.env` file.
 
 > ⚠️ Replace `ghp_PASTE_YOUR_TOKEN_HERE` (or `glpat-...`) with the actual token you copied.
 
@@ -160,6 +194,82 @@ python repo_evaluator.py gitlab:acme-corp/billing-service --platform gitlab --js
 ```
 python repo_evaluator.py acme-corp/billing-service --json --output results.json --skip-f2p --skip-quality-checks --skip-taxonomy --skip-pr-rubrics
 ```
+
+### Subversion (SVN) project
+
+Use the **full repository URL** your team uses for `svn checkout`, and set **`--platform svn`**.
+
+**Example** (replace with your real URL):
+
+```
+python repo_evaluator.py https://svn.example.com/myproject/trunk --platform svn --json --output results.json --svn-username YOUR_USER --token YOUR_PASSWORD
+```
+
+You can prefix the URL with `svn:` if you like — both styles work:
+
+```
+python repo_evaluator.py svn:https://svn.example.com/myproject/trunk --platform svn --json --output results.json --svn-username YOUR_USER --token YOUR_PASSWORD
+```
+
+**Check out a specific revision** (optional):
+
+```
+python repo_evaluator.py https://svn.example.com/myproject/trunk --platform svn --svn-revision 12345 --json --output results.json --svn-username YOUR_USER --token YOUR_PASSWORD
+```
+
+**If your company uses a self-signed HTTPS certificate**, add:
+
+```
+--svn-trust-cert
+```
+
+**Already have a local working copy?** Point to it and still pass the URL (used for naming and for the report):
+
+```
+python repo_evaluator.py https://svn.example.com/myproject/trunk --platform svn --repo-path /path/to/your/checkout --json --output results.json
+```
+
+**Faster SVN run** (skips slow / PR-oriented steps):
+
+```
+python repo_evaluator.py https://svn.example.com/myproject/trunk --platform svn --json --output results.json --skip-f2p --skip-quality-checks --skip-taxonomy --skip-pr-rubrics --svn-username YOUR_USER --token YOUR_PASSWORD
+```
+
+### Local directory (any folder on your machine)
+
+No remote URL or token needed — just pass the **path** to the folder you want to evaluate. The tool auto-detects paths that start with `/`, `~`, `./`, or `.`.
+
+**Current directory:**
+
+```
+python repo_evaluator.py . --json --output results.json
+```
+
+**Absolute path:**
+
+```
+python repo_evaluator.py /Users/you/projects/my-app --json --output results.json
+```
+
+**Home-relative path:**
+
+```
+python repo_evaluator.py ~/projects/my-app --json --output results.json
+```
+
+**Explicit platform flag** (handy if auto-detection is ambiguous):
+
+```
+python repo_evaluator.py some-folder --platform local --json --output results.json
+```
+
+**Faster local run** (skips slow / PR-oriented steps):
+
+```
+python repo_evaluator.py /path/to/project --json --output results.json --skip-f2p --skip-quality-checks --skip-taxonomy --skip-pr-rubrics
+```
+
+> If the folder is a Git repo the evaluator will pick up commit history automatically. If it's an SVN working copy it will read `svn log` from the working copy. Plain folders still get full file analysis.
 
 ### Where are my results?
 
@@ -258,6 +368,59 @@ This creates a single `output/combined.csv` file you can open in **Excel** or **
 
 ---
 
+## 🚀 Evaluate Many SVN URLs at Once
+
+Use this when you have a **text file** with one SVN URL per line. (To discover all repos under a GitHub org or GitLab group, use **`run_all_repos.py`** instead.)
+
+### Step 1 — Create a URLs file
+
+Create a file such as `svn_urls.txt` in the `lh2-datalabs-eval-kit` folder. Each non-empty line is one repository. Lines starting with `#` are ignored.
+
+**Examples:**
+
+```
+# Team libraries
+https://svn.example.com/lib/widget/trunk
+https://svn.example.com/lib/parser/trunk|10420
+https://svn.example.com/tools/build 50000
+```
+
+You can add a **revision** using a pipe (`URL|12345` or `URL|r12345`), a **tab** between URL and number, or a **space** before the final number.
+
+Use **`--default-revision`** in the next step to apply one revision to every line that does not specify its own.
+
+### Step 2 — Run the bulk SVN script
+
+```
+python bulk_svn_evaluator.py --urls-file svn_urls.txt --workers 4 --output-dir eval_results/svn_bulk --svn-username YOUR_USER --token YOUR_PASSWORD
+```
+
+**Faster run** (skips heavy steps for each repo):
+
+```
+python bulk_svn_evaluator.py --urls-file svn_urls.txt --workers 4 --output-dir eval_results/svn_bulk --svn-username YOUR_USER --token YOUR_PASSWORD --evaluator-args "--skip-f2p --skip-quality-checks --skip-taxonomy --skip-pr-rubrics"
+```
+
+**Optional:** same revision for all lines that omit one:
+
+```
+python bulk_svn_evaluator.py --urls-file svn_urls.txt --default-revision 9000 --svn-username YOUR_USER --token YOUR_PASSWORD
+```
+
+**SSL issues:** add `--svn-trust-cert`.
+
+You can also set **`SVN_EVALUATOR_ARGS`** in the environment for extra flags (shell-style splitting).
+
+### Step 3 — Find your results
+
+Under `eval_results/svn_bulk/` (or your `--output-dir`):
+
+- Each URL gets a subfolder with **`eval.json`** and **`_run.json`**
+- **`_summary.json`** lists every run, timings, and errors
+
+
+---
+
 ## 🎯 Common Scenarios — Just Copy and Paste
 
 ### "I want to evaluate just one specific organization"
@@ -290,6 +453,33 @@ python run_all_repos.py --run --exclude-repo acme-corp/old-project
 python run_all_repos.py --platform gitlab --run --gitlab-url https://gitlab.mycompany.com
 ```
 
+### "I have a project on my machine and just want to scan it"
+
+```
+python repo_evaluator.py /path/to/my/project --json --output results.json
+```
+
+or from inside the project folder:
+
+```
+python repo_evaluator.py . --json --output results.json
+```
+
+### "I need to evaluate several SVN URLs"
+
+Create `svn_urls.txt` and follow [Evaluate Many SVN URLs at Once](#evaluate-many-svn-urls-at-once).
+
+### "SVN history in the report looks truncated"
+
+The tool may cap how many revisions it reads from `svn log` (see **README.md** for **`SVN_LOG_LIMIT`**). To load **all** revisions (can be slow on huge repositories), run:
+
+```
+export SVN_LOG_LIMIT=0
+```
+
+before `repo_evaluator.py` or `bulk_svn_evaluator.py`.
+
+
 ---
 
 ## 📊 What's In The Report?
@@ -305,7 +495,7 @@ Each project's report tells you:
 | **Test frameworks** | What testing tools are used (e.g. pytest, jest, junit) |
 | **Total commits** | How many code changes have been made over the project's lifetime |
 | **Contributors** | How many people have worked on the project |
-| **PR acceptance rate** | What percentage of pull requests passed quality checks |
+| **PR acceptance rate** | What percentage of pull requests passed quality checks *(not applicable to pure SVN — usually 0% or empty)* |
 | **Open source likelihood** | Low / Medium / High — whether the project appears to be open source |
 | **AI risk level** | Low / Medium / High — whether the code shows signs of being AI-generated |
 
@@ -322,6 +512,10 @@ Each project's report tells you:
 | **It's running very slowly** | Use the "faster version" commands shown above — they skip the time-consuming AI analysis steps. |
 | **Commands don't work after I re-open Terminal** | You need to re-activate the tool every time: run `cd lh2-datalabs-eval-kit` then `source .venv/bin/activate` |
 | **GitLab: "insufficient_granular_scope"** | Your token is missing scopes. Re-create it with `read_api`, `read_repository`, and `read_user` checked. |
+| **Local: "Local path is not a directory"** | The path you gave doesn't exist or isn't a folder. Double-check it with `ls /your/path`. |
+| **SVN: "svn checkout failed"** | Check the URL, username, and password. Try `--svn-trust-cert` if HTTPS uses an internal certificate. Confirm `svn --version` works. |
+| **SVN: SSL or certificate errors** | Add `--svn-trust-cert` to `repo_evaluator.py`. For bulk runs, add `--svn-trust-cert` to `bulk_svn_evaluator.py`. |
+| **SVN: authentication failed** | Use `--svn-username` and `--token` (password). For bulk runs, `--token` or `SVN_PASSWORD` / `TOKEN` env vars. |
 
 ---
 
@@ -337,6 +531,11 @@ Each project's report tells you:
 | Evaluate only one organization | `python run_all_repos.py --run --org my-org-name` |
 | Evaluate **one** GitHub project | `python repo_evaluator.py owner/repo --json --output results.json` |
 | Evaluate **one** GitLab project | `python repo_evaluator.py gitlab:group/repo --platform gitlab --json --output results.json` |
+| Evaluate a **local folder** | `python repo_evaluator.py /path/to/project --json --output results.json` |
+| Evaluate **current directory** | `python repo_evaluator.py . --json --output results.json` |
+| Evaluate **one** SVN project | `python repo_evaluator.py https://svn.example.com/proj/trunk --platform svn --json --output results.json --svn-username USER --token PASS` |
+| Evaluate **one** SVN project at revision *N* | `python repo_evaluator.py URL --platform svn --svn-revision N --json --output results.json --svn-username USER --token PASS` |
+| Evaluate **many** SVN URLs from a file | `python bulk_svn_evaluator.py --urls-file svn_urls.txt --workers 4 --svn-username USER --token PASS` |
 | Evaluate one project **(fast)** | `python repo_evaluator.py owner/repo --json --output results.json --skip-f2p --skip-quality-checks --skip-taxonomy --skip-pr-rubrics` |
 | Combine all CSVs into one spreadsheet | `python consolidate_output.py` |
 

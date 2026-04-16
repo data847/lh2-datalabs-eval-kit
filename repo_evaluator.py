@@ -5,7 +5,7 @@ Analyzes repositories for quality and suitability by combining:
 - Repository-level metrics (file structure, test coverage, CI/CD, etc.)
 - PR-level analysis with detailed rejection tracking
 
-Supports GitHub, Bitbucket, and GitLab repositories.
+Supports GitHub, Bitbucket, GitLab, Subversion (SVN) checkouts, and local directories.
 
 Usage:
     # With GitHub token (for private repos or higher rate limits)
@@ -20,6 +20,14 @@ Usage:
     # With GitLab repository
     python repo_evaluator.py gitlab:group/subgroup/repo --token $GITLAB_TOKEN --platform gitlab
 
+    # Subversion (URL with optional svn: prefix; use --svn-username for auth)
+    python repo_evaluator.py svn:https://svn.example.com/myrepo/trunk --platform svn --svn-username me --token $SVN_PASSWORD
+
+    # Local directory (auto-detected from path; git, svn, or plain folder)
+    python repo_evaluator.py /path/to/my/project --json --output results.json
+    python repo_evaluator.py .  --json --output results.json
+    python repo_evaluator.py ~/projects/my-app --platform local --json
+
 Examples:
     python repo_evaluator.py microsoft/vscode --token $GITHUB_TOKEN
     python repo_evaluator.py bitbucket:owner/repo --token $BITBUCKET_TOKEN --platform bitbucket
@@ -28,6 +36,7 @@ Examples:
 
 import argparse
 import csv
+import hashlib
 import json
 import logging
 import os
@@ -36,8 +45,10 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.parse
+import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -119,7 +130,9 @@ try:
         BitbucketClient,
         GitHubClient,
         GitLabClient,
+        LocalClient,
         PlatformClient,
+        SvnClient,
         detect_platform,
     )
 except Exception:
@@ -127,7 +140,9 @@ except Exception:
         BitbucketClient,
         GitHubClient,
         GitLabClient,
+        LocalClient,
         PlatformClient,
+        SvnClient,
         detect_platform,
     )
 
@@ -834,6 +849,7 @@ class RepoAnalyzer:
             raise ValueError(f"Repository path does not exist: {repo_path}")
         self.repo_name = self.repo_path.name
         self.is_git_repo = (self.repo_path / ".git").exists()
+        self.is_svn_repo = (self.repo_path / ".svn").exists() and not self.is_git_repo
         self.owner = owner
         self.repo_name_github = repo_name
         self.platform_client = platform_client
@@ -874,7 +890,12 @@ class RepoAnalyzer:
         has_test_runner = len(test_frameworks) > 0
         comment_metrics = _estimate_comment_density(files)
 
-        git_metrics = self._analyze_git_history() if self.is_git_repo else {}
+        if self.is_git_repo:
+            git_metrics = self._analyze_git_history()
+        elif self.is_svn_repo:
+            git_metrics = self._analyze_svn_history()
+        else:
+            git_metrics = {}
 
         # Try to find coverage reports
         test_coverage = self._find_coverage_reports()
@@ -994,6 +1015,7 @@ class RepoAnalyzer:
 
         ignore_dirs = {
             ".git",
+            ".svn",
             "node_modules",
             "__pycache__",
             ".venv",
@@ -1875,6 +1897,272 @@ class RepoAnalyzer:
 
         return metrics
 
+    def _parse_svn_log_date(self, raw: str) -> Optional[datetime]:
+        if not raw:
+            return None
+        s = raw.strip()
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        try:
+            d = datetime.fromisoformat(s)
+            if d.tzinfo is None:
+                d = d.replace(tzinfo=timezone.utc)
+            return d
+        except ValueError:
+            return None
+
+    def _analyze_svn_history(self) -> Dict[str, Any]:
+        """Analyze Subversion history via `svn log --xml -v` (working copy)."""
+        metrics: Dict[str, Any] = {}
+        try:
+            limit_raw = (os.environ.get("SVN_LOG_LIMIT") or "25000").strip()
+            cmd = ["svn", "log", "--xml", "-v"]
+            if limit_raw and limit_raw != "0":
+                try:
+                    lim = int(limit_raw)
+                    if lim > 0:
+                        cmd.extend(["-l", str(lim)])
+                except ValueError:
+                    pass
+
+            result = subprocess.run(
+                cmd,
+                cwd=self.repo_path,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=600,
+            )
+            if result.returncode != 0:
+                logger.warning(
+                    "svn log failed: %s",
+                    (result.stderr or result.stdout or "")[:500],
+                )
+                return metrics
+
+            root = ET.fromstring(result.stdout)
+            entries = root.findall("logentry")
+            if not entries:
+                return metrics
+
+            parsed = []
+            issue_ref_re = re.compile(r"#\d+")
+            now = datetime.now(timezone.utc)
+            cutoff_6m = now - timedelta(days=183)
+            cutoff_12m = now - timedelta(days=365)
+
+            for el in entries:
+                rev_s = el.get("revision")
+                if not rev_s:
+                    continue
+                try:
+                    rev = int(rev_s)
+                except ValueError:
+                    continue
+                date_el = el.find("date")
+                author_el = el.find("author")
+                msg_el = el.find("msg")
+                dt = self._parse_svn_log_date(date_el.text if date_el is not None else "")
+                author = (author_el.text or "").strip() if author_el is not None else ""
+                msg = (msg_el.text or "").strip() if msg_el is not None else ""
+                paths_el = el.find("paths")
+                path_count = 0
+                touched: List[str] = []
+                if paths_el is not None:
+                    for p in paths_el.findall("path"):
+                        t = (p.text or "").strip()
+                        if t:
+                            touched.append(t)
+                    path_count = len(touched)
+
+                parsed.append(
+                    {
+                        "rev": rev,
+                        "dt": dt,
+                        "author": author,
+                        "msg": msg,
+                        "path_count": path_count,
+                        "paths": touched,
+                    }
+                )
+
+            metrics["total_commits"] = len(parsed)
+            metrics["recent_commits_6mo"] = sum(
+                1 for x in parsed if x["dt"] and x["dt"] >= cutoff_6m
+            )
+            metrics["recent_commits_12mo"] = sum(
+                1 for x in parsed if x["dt"] and x["dt"] >= cutoff_12m
+            )
+            metrics["commits_referencing_issues"] = sum(
+                1 for x in parsed if x["msg"] and issue_ref_re.search(x["msg"])
+            )
+
+            all_commit_ts = sorted(
+                int(x["dt"].timestamp()) for x in parsed if x["dt"] is not None
+            )
+            if len(all_commit_ts) >= 2:
+                metrics["commit_spread_days"] = round(
+                    (all_commit_ts[-1] - all_commit_ts[0]) / 86400, 1
+                )
+
+            commit_days = set()
+            contributors = set()
+            commit_messages: List[str] = []
+            ordered_ts: List[int] = []
+            for x in parsed:
+                if x["dt"]:
+                    commit_days.add(
+                        x["dt"].astimezone(timezone.utc).strftime("%Y-%m-%d")
+                    )
+                    ordered_ts.append(int(x["dt"].timestamp()))
+                if x["author"]:
+                    contributors.add(x["author"].lower())
+                if x["msg"]:
+                    commit_messages.append(x["msg"])
+
+            ordered_ts.sort()
+            if len(ordered_ts) >= 2:
+                intervals_hours = []
+                for i in range(1, len(ordered_ts)):
+                    intervals_hours.append((ordered_ts[i] - ordered_ts[i - 1]) / 3600)
+                intervals_hours.sort()
+                n_iv = len(intervals_hours)
+                if n_iv % 2 == 0:
+                    median = (
+                        intervals_hours[n_iv // 2 - 1] + intervals_hours[n_iv // 2]
+                    ) / 2
+                else:
+                    median = intervals_hours[n_iv // 2]
+                metrics["median_commit_interval_hours"] = round(median, 2)
+
+            metrics["unique_commit_days"] = len(commit_days)
+            metrics["contributors_total"] = len(contributors)
+            metrics["commit_messages"] = commit_messages
+
+            if all_commit_ts:
+                first_ts = all_commit_ts[0]
+                latest_ts = all_commit_ts[-1]
+                repo_age_days = max(1, int((latest_ts - first_ts) / 86400))
+                metrics["repo_age_days"] = repo_age_days
+                metrics["commit_spread_ratio"] = round(
+                    _safe_div(len(commit_days), repo_age_days), 4
+                )
+
+            metrics["branch_count"] = 1
+
+            by_rev = {x["rev"]: x for x in parsed}
+            revs_sorted = sorted(by_rev.keys())
+            commit_loc_list: List[int] = []
+            commit_loc_items: List[Dict[str, Any]] = []
+            file_touch_counts: Dict[str, int] = {}
+
+            for r in revs_sorted:
+                x = by_rev[r]
+                pc = x["path_count"]
+                commit_loc_list.append(pc)
+                commit_loc_items.append({"sha": str(r), "loc": pc})
+                for fp in x["paths"]:
+                    file_touch_counts[fp] = file_touch_counts.get(fp, 0) + 1
+
+            metrics["commit_loc_list"] = commit_loc_list
+            metrics["commit_loc_items"] = commit_loc_items
+            total_commit_loc = sum(commit_loc_list)
+            sorted_locs = sorted(commit_loc_list, reverse=True)
+            largest = sorted_locs[0] if sorted_locs else 0
+            top10 = sum(sorted_locs[:10]) if sorted_locs else 0
+            metrics["avg_loc_per_commit"] = round(
+                _safe_div(
+                    total_commit_loc,
+                    len(commit_loc_list) if commit_loc_list else metrics.get("total_commits", 0),
+                ),
+                2,
+            )
+            if commit_loc_list:
+                sorted_for_median = sorted(commit_loc_list)
+                n_loc = len(sorted_for_median)
+                if n_loc % 2 == 0:
+                    median_loc = (
+                        sorted_for_median[n_loc // 2 - 1]
+                        + sorted_for_median[n_loc // 2]
+                    ) / 2
+                else:
+                    median_loc = sorted_for_median[n_loc // 2]
+                metrics["median_loc_per_commit"] = round(median_loc, 2)
+            else:
+                metrics["median_loc_per_commit"] = 0.0
+            metrics["single_commit_loc_share"] = round(
+                _safe_div(largest, total_commit_loc), 4
+            )
+            metrics["top10_commit_loc_share"] = round(
+                _safe_div(top10, total_commit_loc), 4
+            )
+            metrics["first_5_commits_loc"] = commit_loc_list[:5]
+            metrics["top_10_commits_by_loc"] = sorted(
+                commit_loc_items, key=lambda z: z.get("loc", 0), reverse=True
+            )[:10]
+
+            files_touched_total = len(file_touch_counts)
+            files_touched_2plus = sum(
+                1 for c in file_touch_counts.values() if c >= 2
+            )
+            metrics["files_touched_total"] = files_touched_total
+            metrics["files_touched_2plus"] = files_touched_2plus
+            metrics["code_churn_rate"] = round(
+                _safe_div(files_touched_2plus, files_touched_total), 4
+            )
+
+            min_rev = revs_sorted[0] if revs_sorted else None
+            first_loc = 0
+            if min_rev is not None:
+                diff_r = subprocess.run(
+                    ["svn", "diff", "-c", str(min_rev)],
+                    cwd=self.repo_path,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=120,
+                )
+                if diff_r.returncode == 0 and diff_r.stdout:
+                    for line in diff_r.stdout.splitlines():
+                        if line.startswith("+") and not line.startswith("+++"):
+                            first_loc += 1
+                        elif line.startswith("-") and not line.startswith("---"):
+                            first_loc += 1
+            metrics["first_commit_loc"] = first_loc
+
+            if commit_messages:
+                normalized = [m.lower() for m in commit_messages if m.strip()]
+                message_lengths = [len(m) for m in commit_messages if m.strip()]
+                metrics["commit_message_unique_ratio"] = round(
+                    _safe_div(len(set(normalized)), len(normalized)), 4
+                )
+                metrics["commit_message_avg_len"] = round(
+                    _safe_div(sum(len(m) for m in commit_messages), len(commit_messages)),
+                    2,
+                )
+                if message_lengths:
+                    sorted_lengths = sorted(message_lengths)
+                    n_msg = len(sorted_lengths)
+                    if n_msg % 2 == 0:
+                        median_len = (
+                            sorted_lengths[n_msg // 2 - 1] + sorted_lengths[n_msg // 2]
+                        ) / 2
+                    else:
+                        median_len = sorted_lengths[n_msg // 2]
+                    avg_len = _safe_div(sum(message_lengths), n_msg)
+                    variance = _safe_div(
+                        sum((v - avg_len) ** 2 for v in message_lengths), n_msg
+                    )
+                    metrics["commit_message_median_len"] = round(median_len, 2)
+                    metrics["commit_message_variance"] = round(variance, 2)
+
+        except Exception as e:
+            logger.warning(f"Could not analyze svn history: {e}")
+
+        return metrics
+
     def _compute_open_source_signals(self, files: List[Path]) -> Dict[str, Any]:
         score = 0
         signals = []
@@ -2736,9 +3024,12 @@ class RepoEvaluator:
 
         # Repo health checks
         files = repo_analyzer._get_all_files()
-        git_metrics = (
-            repo_analyzer._analyze_git_history() if repo_analyzer.is_git_repo else {}
-        )
+        if repo_analyzer.is_git_repo:
+            git_metrics = repo_analyzer._analyze_git_history()
+        elif repo_analyzer.is_svn_repo:
+            git_metrics = repo_analyzer._analyze_svn_history()
+        else:
+            git_metrics = {}
         readme_metrics = _find_readme_metrics(Path(self.repo_path))
         comment_metrics = _estimate_comment_density(files)
         process_health = compute_process_health_checks(
@@ -3401,6 +3692,109 @@ def write_json_dict_to_csv(data: dict, csv_path: Path) -> None:
         writer.writerow(row)
 
 
+def parse_svn_repository(repo_string: str) -> Tuple[str, str, str]:
+    """Parse SVN target into (checkout URL, owner_host, short_repo_name)."""
+    s = repo_string.strip()
+    low = s.lower()
+    if low.startswith("svn+"):
+        colon = s.find(":")
+        if colon >= 0:
+            s = s[colon + 1 :].lstrip()
+    elif low.startswith("svn:"):
+        s = s[4:].strip()
+
+    if not (
+        s.startswith("http://")
+        or s.startswith("https://")
+        or s.startswith("svn://")
+        or s.startswith("file://")
+    ):
+        raise ValueError(
+            "SVN repository must be a URL "
+            "(http(s)://, svn://, file://, or svn+http(s)://). "
+            f"Got: {repo_string!r}"
+        )
+
+    parsed = urllib.parse.urlparse(s)
+    host = (parsed.netloc or "localhost").split("@")[-1]
+    path = (parsed.path or "/").rstrip("/") or "/"
+    repo_label = path.split("/")[-1] or "repo"
+    return s, host, repo_label
+
+
+def resolve_svn_checkout_timeout(cli_seconds: Optional[int]) -> Optional[int]:
+    """
+    Seconds for svn checkout subprocess, or None for no limit.
+    CLI override wins; else SVN_CHECKOUT_TIMEOUT env (default 900). Use 0 for unlimited.
+    """
+    if cli_seconds is not None:
+        return None if cli_seconds <= 0 else cli_seconds
+    raw = (os.environ.get("SVN_CHECKOUT_TIMEOUT") or "900").strip()
+    if raw == "0":
+        return None
+    try:
+        n = int(raw)
+        return None if n <= 0 else n
+    except ValueError:
+        return 900
+
+
+def checkout_svn_repo(
+    svn_url: str,
+    temp_dir: Path,
+    username: Optional[str],
+    password: Optional[str],
+    trust_server_cert: bool = False,
+    revision: Optional[int] = None,
+    checkout_timeout_sec: Optional[int] = None,
+) -> Path:
+    """Check out an SVN URL into a subdirectory of temp_dir (requires `svn` on PATH)."""
+    dest_key = f"{svn_url}\0{revision if revision is not None else ''}"
+    dest = temp_dir / (
+        "svn_wc_" + hashlib.sha256(dest_key.encode("utf-8")).hexdigest()[:16]
+    )
+    if dest.exists():
+        shutil.rmtree(dest, ignore_errors=True)
+
+    cmd = ["svn", "checkout"]
+    if revision is not None:
+        cmd.extend(["-r", str(revision)])
+    cmd.extend(
+        [
+            svn_url,
+            str(dest),
+            "--non-interactive",
+            "--no-auth-cache",
+        ]
+    )
+    if username:
+        cmd.extend(["--username", username])
+    if password:
+        cmd.extend(["--password", password])
+    if trust_server_cert:
+        cmd.extend(
+            [
+                "--trust-server-cert-failures",
+                "unknown-ca,cn-mismatch,expired,not-yet-valid,other",
+            ]
+        )
+
+    timeout = resolve_svn_checkout_timeout(checkout_timeout_sec)
+    t_msg = "unlimited" if timeout is None else f"{timeout}s"
+    logger.info("Running SVN checkout into %s (timeout=%s)", dest, t_msg)
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    if result.returncode != 0:
+        err = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(f"svn checkout failed: {err[:2000]}")
+
+    return dest
+
+
 def clone_repo(
     repo_full_name: str, temp_dir: Path, token: str, platform: str = "github"
 ) -> Path:
@@ -3494,9 +3888,31 @@ def main():
     )
     parser.add_argument(
         "--platform",
-        choices=["auto", "github", "bitbucket", "gitlab"],
+        choices=["auto", "github", "bitbucket", "gitlab", "svn", "local"],
         default="auto",
-        help="Platform to use (default: auto-detect from repo string)",
+        help="Platform to use (default: auto-detect from repo string or local path)",
+    )
+    parser.add_argument(
+        "--svn-username",
+        default=None,
+        help="SVN username for checkout (or set SVN_USERNAME)",
+    )
+    parser.add_argument(
+        "--svn-trust-cert",
+        action="store_true",
+        help="Pass --trust-server-cert-failures to svn for self-signed / SSL issues",
+    )
+    parser.add_argument(
+        "--svn-revision",
+        type=int,
+        default=None,
+        help="SVN revision for checkout (-r REV), e.g. peg a historical revision",
+    )
+    parser.add_argument(
+        "--svn-checkout-timeout",
+        type=int,
+        default=None,
+        help="svn checkout timeout in seconds (default: 900 or SVN_CHECKOUT_TIMEOUT; use 0 for no limit)",
     )
     parser.add_argument(
         "--min-test-files",
@@ -3606,18 +4022,40 @@ def main():
 
     # Get token (prefer --token, fallback to --github-token for backward compatibility)
     token = args.token or args.github_token
-    if not token:
+    if not token and platform not in ("local",):
         logger.warning("No token provided. API rate limits may apply.")
 
-    # Parse repo name
-    try:
-        owner, repo_name = parse_repo_name(args.repo)
-    except ValueError as e:
-        logger.error(str(e))
-        sys.exit(1)
+    svn_url = ""
+    svn_user = args.svn_username or os.environ.get("SVN_USERNAME")
+
+    # Parse repo name / SVN URL / local path
+    if platform == "local":
+        local_path = Path(args.repo).expanduser().resolve()
+        if not local_path.is_dir():
+            logger.error(f"Local path is not a directory: {args.repo}")
+            sys.exit(1)
+        owner = local_path.parent.name or "local"
+        repo_name = local_path.name or "repo"
+        logger.info(f"Local mode: {local_path}  (owner={owner}, repo={repo_name})")
+    else:
+        local_path = None
+        try:
+            if platform == "svn":
+                svn_url, owner, repo_name = parse_svn_repository(args.repo)
+            else:
+                owner, repo_name = parse_repo_name(args.repo)
+        except ValueError as e:
+            logger.error(str(e))
+            sys.exit(1)
 
     # Create platform client
-    if platform == "bitbucket":
+    if platform == "local":
+        platform_client = LocalClient(owner, repo_name, repo_path=str(local_path))
+    elif platform == "svn":
+        platform_client = SvnClient(
+            owner, repo_name, token, svn_url=svn_url, svn_username=svn_user
+        )
+    elif platform == "bitbucket":
         platform_client = BitbucketClient(owner, repo_name, token)
     elif platform == "gitlab":
         platform_client = GitLabClient(owner, repo_name, token)
@@ -3628,15 +4066,29 @@ def main():
     temp_dir = None
     should_cleanup = True
 
-    if not repo_path:
+    if platform == "local":
+        repo_path = str(local_path)
+        should_cleanup = False
+    elif not repo_path:
         # Auto-clone to temp directory
         temp_dir = Path(tempfile.mkdtemp(prefix="repo_evaluator_"))
         try:
-            # if not token:
-            #     raise ValueError("Token is required for cloning repositories")
-            repo_path = str(
-                clone_repo(f"{owner}/{repo_name}", temp_dir, token, platform)
-            )
+            if platform == "svn":
+                repo_path = str(
+                    checkout_svn_repo(
+                        svn_url,
+                        temp_dir,
+                        username=svn_user,
+                        password=token,
+                        trust_server_cert=args.svn_trust_cert,
+                        revision=args.svn_revision,
+                        checkout_timeout_sec=args.svn_checkout_timeout,
+                    )
+                )
+            else:
+                repo_path = str(
+                    clone_repo(f"{owner}/{repo_name}", temp_dir, token, platform)
+                )
         except Exception as e:
             logger.error(f"Failed to clone repository: {e}")
             if temp_dir and temp_dir.exists():
@@ -3669,6 +4121,12 @@ def main():
 
         report = evaluator.evaluate()
         report_json = to_json(report)
+        if platform == "local":
+            report_json["local_path"] = str(local_path)
+        elif platform == "svn" and svn_url:
+            report_json["svn_url"] = svn_url
+            if args.svn_revision is not None:
+                report_json["svn_revision"] = args.svn_revision
 
         if not args.skip_quality_checks:
             qc_results = run_all_quality_checks(

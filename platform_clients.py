@@ -73,30 +73,52 @@ def retry_api_call(func: Callable, max_retries: int = MAX_RETRIES, *args, **kwar
         raise last_exception
 
 
+def _looks_like_local_path(s: str) -> bool:
+    """Heuristic: is this a filesystem path rather than a remote repo spec?"""
+    if s in (".", "..") or s.startswith("/") or s.startswith("~"):
+        return True
+    if s.startswith("./") or s.startswith("../"):
+        return True
+    if len(s) >= 2 and s[1] == ":":
+        return True
+    import os
+    return os.path.isdir(s)
+
+
 def detect_platform(repo_string: str, explicit_platform: Optional[str] = "auto") -> str:
     if explicit_platform:
         explicit_platform = explicit_platform.lower()
-        if explicit_platform in ["github", "bitbucket", "gitlab"]:
+        if explicit_platform in ["github", "bitbucket", "gitlab", "svn", "local"]:
             return explicit_platform
         if explicit_platform != "auto":
             raise ValueError(
-                f"Invalid platform: {explicit_platform}. Must be 'github', 'bitbucket', 'gitlab', or 'auto'"
+                f"Invalid platform: {explicit_platform}. "
+                "Must be 'github', 'bitbucket', 'gitlab', 'svn', 'local', or 'auto'"
             )
 
-    repo_string = repo_string.strip().lower()
-    if repo_string.startswith("bitbucket:"):
+    repo_string = repo_string.strip()
+    repo_lower = repo_string.lower()
+
+    if _looks_like_local_path(repo_string):
+        return "local"
+
+    if repo_lower.startswith("svn:") or repo_lower.startswith("svn+"):
+        return "svn"
+    if repo_lower.startswith("bitbucket:"):
         return "bitbucket"
-    if repo_string.startswith("github:"):
+    if repo_lower.startswith("github:"):
         return "github"
-    if repo_string.startswith("gitlab:"):
+    if repo_lower.startswith("gitlab:"):
         return "gitlab"
 
-    if "bitbucket.org" in repo_string:
+    if "bitbucket.org" in repo_lower:
         return "bitbucket"
-    if "gitlab." in repo_string or "gitlab/" in repo_string:
+    if "gitlab." in repo_lower or "gitlab/" in repo_lower:
         return "gitlab"
-    if "github.com" in repo_string:
+    if "github.com" in repo_lower:
         return "github"
+    if repo_lower.startswith("svn://"):
+        return "svn"
     return "github"
 
 
@@ -839,3 +861,108 @@ class GitLabClient(PlatformClient):
             return "\n".join(chunks) if chunks else None
         except Exception:
             return None
+
+
+class SvnClient(PlatformClient):
+    """Subversion working-copy adapter (no PR API; fetch_prs returns empty nodes)."""
+
+    def __init__(
+        self,
+        owner: str,
+        repo_name: str,
+        token: Optional[str] = None,
+        svn_url: str = "",
+        svn_username: Optional[str] = None,
+    ):
+        super().__init__(owner, repo_name, token)
+        self.svn_url = svn_url or ""
+        self.svn_username = svn_username
+
+    def fetch_prs(
+        self,
+        cursor: Optional[str] = None,
+        page_size: int = 50,
+        start_date: Optional[datetime] = None,
+    ) -> dict:
+        return {
+            "data": {
+                "repository": {
+                    "primaryLanguage": {"name": None},
+                    "owner": {"login": self.owner},
+                    "name": self.repo_name,
+                    "pullRequests": {
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                        "nodes": [],
+                    },
+                }
+            }
+        }
+
+    def fetch_issue(self, issue_number: int) -> Optional[dict]:
+        return None
+
+    def get_repo_url(self, include_token: bool = False) -> str:
+        return self.svn_url
+
+    def extract_issue_number_from_text(self, text: str) -> List[int]:
+        if not text:
+            return []
+        nums = [int(m) for m in re.findall(r"#(\d+)", text)]
+        return list(set(nums))
+
+    def fetch_repo_languages(self) -> Optional[Dict[str, int]]:
+        return None
+
+    def fetch_issue_count(self) -> dict:
+        return {"open": 0, "closed": 0, "total": 0}
+
+    def fetch_patch(self, base_commit: str, head_commit: str) -> Optional[str]:
+        return None
+
+
+class LocalClient(PlatformClient):
+    """Offline adapter for local directories (git, svn, or plain folders)."""
+
+    def __init__(self, owner: str, repo_name: str, repo_path: str = ""):
+        super().__init__(owner, repo_name, token=None)
+        self.repo_path = repo_path
+
+    def fetch_prs(
+        self,
+        cursor: Optional[str] = None,
+        page_size: int = 50,
+        start_date: Optional[datetime] = None,
+    ) -> dict:
+        return {
+            "data": {
+                "repository": {
+                    "primaryLanguage": {"name": None},
+                    "owner": {"login": self.owner},
+                    "name": self.repo_name,
+                    "pullRequests": {
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                        "nodes": [],
+                    },
+                }
+            }
+        }
+
+    def fetch_issue(self, issue_number: int) -> Optional[dict]:
+        return None
+
+    def get_repo_url(self, include_token: bool = False) -> str:
+        return self.repo_path
+
+    def extract_issue_number_from_text(self, text: str) -> List[int]:
+        if not text:
+            return []
+        return list(set(int(m) for m in re.findall(r"#(\d+)", text)))
+
+    def fetch_repo_languages(self) -> Optional[Dict[str, int]]:
+        return None
+
+    def fetch_issue_count(self) -> dict:
+        return {"open": 0, "closed": 0, "total": 0}
+
+    def fetch_patch(self, base_commit: str, head_commit: str) -> Optional[str]:
+        return None
