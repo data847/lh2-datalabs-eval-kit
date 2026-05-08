@@ -541,6 +541,83 @@ Each project's report tells you:
 
 ---
 
+## 🖥️ Streamlit UI (repo picker)
+
+The eval kit ships with a browser UI to browse GitHub orgs/repos and run **`repo_evaluator.py`** or **`cybersecurity_pr_scanner.py`** without copying long commands manually.
+
+### What you need installed
+
+| Requirement | Why |
+|---|---|
+| **Python 3** + **[virtual env](README.md)** | Same setup as the rest of the toolkit. |
+| **Dependencies**: `pip install -r requirements.txt` | Pulls **`streamlit`**, **`requests`**, **`python-dotenv`**, **`openai`**, etc. (`requirements.txt` is in the repo root.) |
+| **`.env`** in **`lh2-datalabs-eval-kit/`** | Same file as CLI: **`GITHUB_TOKEN`** or **`GH_TOKEN`** for GitHub API. |
+| **`OPENAI_API_KEY`** (optional but recommended for security scans) | Only needed if you use the **Cybersecurity PR scanner** with **Layer 2** (LLM classification). Leave Layer 2 off or use **`--skip-layer2`** if you do not want OpenAI. |
+
+### Run the Streamlit UI
+
+From the **`lh2-datalabs-eval-kit`** folder (same place as **`repo_evaluator.py`**):
+
+```bash
+cd lh2-datalabs-eval-kit
+source .venv/bin/activate    # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+streamlit run ui/github_eval_picker.py
+```
+
+Alternative:
+
+```bash
+python -m streamlit run ui/github_eval_picker.py
+```
+
+1. Enter or confirm your token in the sidebar (or rely on **`GITHUB_TOKEN` / `GH_TOKEN`**).
+2. Click **Connect / verify token**.
+3. Load org or personal repos, select repositories.
+4. Under **What to run**, choose **Full repo evaluator** or **Cybersecurity PR scanner**.
+5. Adjust options and click **Run on selected repositories**.
+
+**Outputs:**
+
+- The sidebar **Output base folder** defaults to **`eval_results`**. Full evaluator runs appear under **`eval_results/ui_runs/<UTC-timestamp>/`**. Cybersecurity scans appear under **`eval_results/ui_security_scans/<UTC-timestamp>/`** (nested per repo slug).
+- Each security scan writes JSON such as **`{repo_slug}/{repo}_security_prs.json`**, plus a **`session_transcript.log`** for that UI session at the **`ui_runs`** or **`ui_security_scans`** timestamp folder root.
+
+Optional: enable **Stream live script logs** to watch subprocess output live (the UI uses **`python -u`** and **`PYTHONUNBUFFERED`** for smoother streaming).
+
+---
+
+## 🔒 Cybersecurity PR scanner (`cybersecurity_pr_scanner.py`)
+
+You can run this from the Terminal **or** from the Streamlit UI (same script).
+
+### Prerequisites
+
+| Item | Detail |
+|---|---|
+| **GitHub token** | **`GITHUB_TOKEN`**, **`GH_TOKEN`**, or **`--token`** on the CLI. Needs enough scope to **list pulls** on the repos you scan (typically **`repo`** for private repos; public repos vary). |
+| **Layer 1 only** (`--skip-layer2`) | No OpenAI; heuristic score + signals only in the JSON. |
+| **Layer 2 (LLM)** | **`OPENAI_API_KEY`** in the environment; **`openai`** package (included via **`requirements.txt`**). Layer 2 runs only when layer 1 score ≥ **`--layer1-threshold`** (default **6** in the CLI). |
+
+### Example CLI commands
+
+Scan one repo, full JSON output (layers 1 + 2 when above threshold):
+
+```bash
+python cybersecurity_pr_scanner.py --repo owner/name --token "$GITHUB_TOKEN" --json-out ./code_security_prs.json --layer1-threshold 6
+```
+
+Heuristics only (no OpenAI):
+
+```bash
+python cybersecurity_pr_scanner.py --repo owner/name --token "$GITHUB_TOKEN" --json-out ./code_security_l1.json --skip-layer2
+```
+
+Useful flags (also mirrored in the UI): **`--max-prs N`**, **`--no-fetch-files`** (faster, skips per-PR file lists), **`--layer2-model gpt-4o-mini`**.
+
+The JSON schema includes **`layer1`** (score/signals) and **`layer2`** when run (`null` when not scored or skipped). **`layer2.is_security_related: true`** is the LLM’s “cybersecurity-relevant” classification.
+
+---
+
 *For advanced options and developer reference, see [README.md](README.md).*
 
 *Internal tool — LH2 Tech / Datalabs*

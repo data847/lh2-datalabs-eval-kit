@@ -1,4 +1,5 @@
 requests
+streamlit>=1.28
 click
 python-dotenv
 openai>=1.0
