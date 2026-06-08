@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Discover all GitHub/GitLab organizations (groups) & repos accessible via a
-token, then run repo_evaluator.py on each one.
+Discover all GitHub/GitLab/Bitbucket organizations (groups/workspaces) & repos
+accessible via a token, then run repo_evaluator.py on each one.
 
 Modes
 ─────
@@ -18,12 +18,19 @@ Quick start
   python run_all_repos.py --platform gitlab --dry-run
   python run_all_repos.py --platform gitlab --token glpat-xxx --dry-run
 
+  # Bitbucket:
+  python run_all_repos.py --platform bitbucket --dry-run
+  python run_all_repos.py --platform bitbucket --token <app-password> --dry-run
+
   # Or export env vars directly:
   export GITHUB_TOKEN=ghp_xxx
   python run_all_repos.py --dry-run
 
   export GITLAB_TOKEN=glpat-xxx
   python run_all_repos.py --platform gitlab --dry-run
+
+  export BITBUCKET_TOKEN=<app-password>
+  python run_all_repos.py --platform bitbucket --dry-run
 
 Configuration priority (highest → lowest)
 ──────────────────────────────────────────
@@ -37,8 +44,9 @@ Supported environment variables
   GITHUB_TOKEN          GitHub Personal Access Token  (or GH_TOKEN)
   GITLAB_TOKEN          GitLab Personal Access Token  (or GL_TOKEN)
   GITLAB_URL            GitLab instance URL            (default: https://gitlab.com)
+  BITBUCKET_TOKEN       Bitbucket App Password / API token  (or BB_TOKEN)
   OPENAI_API_KEY        OpenAI key — passed through to repo_evaluator.py
-  EVAL_PLATFORM         "github" | "gitlab"            (--platform)
+  EVAL_PLATFORM         "github" | "gitlab" | "bitbucket"  (--platform)
   EVAL_ORGS             Comma-separated org/group list (--org)
   EVAL_EXCLUDE_ORGS     Comma-separated orgs to skip   (--exclude-org)
   EVAL_EXCLUDE_REPOS    Comma-separated repos to skip  (--exclude-repo)
@@ -375,6 +383,74 @@ class GitLabAPI:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Bitbucket API helpers
+# ──────────────────────────────────────────────────────────────────────────────
+BITBUCKET_API_BASE = "https://api.bitbucket.org/2.0"
+
+
+class BitbucketAPI:
+    """Thin wrapper around the Bitbucket Cloud REST API v2 with pagination."""
+
+    def __init__(self, token: str) -> None:
+        self.session = requests.Session()
+        self.session.headers.update({
+            "Accept": "application/json",
+            "Authorization": f"Bearer {token}",
+            "User-Agent": "run-all-repos",
+        })
+
+    def _request(self, method: str, url: str, **kw) -> requests.Response:
+        resp = self.session.request(method, url, timeout=60, **kw)
+        if resp.status_code == 429:
+            retry_after = int(resp.headers.get("Retry-After", "5"))
+            print(f"  ⏳ Rate-limited — sleeping {retry_after}s …", file=sys.stderr)
+            time.sleep(retry_after)
+            resp = self.session.request(method, url, timeout=60, **kw)
+        return resp
+
+    def _paginate(self, url: str, params: Optional[dict] = None) -> List[dict]:
+        """Fetch all pages from a list endpoint using Bitbucket's next-link pagination."""
+        results: List[dict] = []
+        while url:
+            resp = self._request("GET", url, params=params)
+            if resp.status_code >= 400:
+                print(f"  ⚠ Bitbucket API error {resp.status_code} for {url}: "
+                      f"{resp.text[:200]}", file=sys.stderr)
+                break
+            data = resp.json()
+            results.extend(data.get("values", []))
+            url = data.get("next")
+            params = None  # next URL already includes query params
+        return results
+
+    def authenticated_user(self) -> dict:
+        resp = self._request("GET", f"{BITBUCKET_API_BASE}/user")
+        resp.raise_for_status()
+        return resp.json()
+
+    def list_workspaces(self) -> List[dict]:
+        """Return workspaces the authenticated user is a member of."""
+        return self._paginate(
+            f"{BITBUCKET_API_BASE}/workspaces",
+            params={"role": "member"},
+        )
+
+    def list_workspace_repos(self, workspace: str) -> List[dict]:
+        """Return all repos in a workspace that the token can see."""
+        return self._paginate(
+            f"{BITBUCKET_API_BASE}/repositories/{workspace}",
+            params={"role": "member"},
+        )
+
+    def list_user_repos(self) -> List[dict]:
+        """Return repos the user owns or is a member of."""
+        return self._paginate(
+            f"{BITBUCKET_API_BASE}/repositories",
+            params={"role": "member"},
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Data model
 # ──────────────────────────────────────────────────────────────────────────────
 @dataclass
@@ -388,7 +464,7 @@ class RepoInfo:
     default_branch: str
     language: Optional[str]
     org: str                # org/group name (or "user" for personal repos)
-    platform: str = "github"  # "github" or "gitlab"
+    platform: str = "github"  # "github", "gitlab", or "bitbucket"
 
 
 @dataclass
@@ -599,6 +675,109 @@ def _gitlab_to_repo_info(p: dict, group: str) -> RepoInfo:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Discovery — Bitbucket
+# ──────────────────────────────────────────────────────────────────────────────
+
+def discover_bitbucket_repos(
+    api: BitbucketAPI,
+    *,
+    only_workspaces: Optional[List[str]] = None,
+    exclude_workspaces: Optional[List[str]] = None,
+    exclude_repos: Optional[List[str]] = None,
+    include_user_repos: bool = False,
+    include_archived: bool = False,
+    include_forks: bool = False,
+    visibility: str = "all",
+) -> Dict[str, List[RepoInfo]]:
+    """
+    Returns { workspace_name: [RepoInfo, …] } for every accessible Bitbucket
+    workspace (+ "user" for personal repos).
+
+    Personal repos are included when:
+      • --include-user-repos is set, OR
+      • no workspaces are found (auto-fallback).
+    """
+    exclude_workspaces_set = set(exclude_workspaces or [])
+    exclude_repos_set = set(exclude_repos or [])
+
+    # 1. Discover workspaces
+    workspaces_raw = api.list_workspaces()
+    workspace_slugs = sorted({w["slug"] for w in workspaces_raw})
+
+    if only_workspaces:
+        wanted = set(only_workspaces)
+        workspace_slugs = [w for w in workspace_slugs if w in wanted]
+
+    workspace_slugs = [w for w in workspace_slugs if w not in exclude_workspaces_set]
+
+    # 2. Fetch repos per workspace
+    result: Dict[str, List[RepoInfo]] = {}
+    seen_repo_uuids: set = set()
+
+    for workspace in workspace_slugs:
+        raw_repos = api.list_workspace_repos(workspace)
+        repos: List[RepoInfo] = []
+        for r in raw_repos:
+            repo_uuid = r.get("uuid", r.get("full_name", ""))
+            if repo_uuid in seen_repo_uuids:
+                continue
+            seen_repo_uuids.add(repo_uuid)
+            ri = _bitbucket_to_repo_info(r, workspace)
+            if _should_include(ri, visibility, include_archived, include_forks,
+                               exclude_repos_set):
+                repos.append(ri)
+        repos.sort(key=lambda x: x.full_name.lower())
+        if repos:
+            result[workspace] = repos
+
+    # 3. Personal repos
+    should_fetch_user = include_user_repos
+    auto_fallback = False
+    if not workspace_slugs and not include_user_repos:
+        should_fetch_user = True
+        auto_fallback = True
+
+    if should_fetch_user:
+        if auto_fallback:
+            print("  ℹ️  No Bitbucket workspaces found — automatically including "
+                  "personal/member repos.")
+        raw_user = api.list_user_repos()
+        user_repos: List[RepoInfo] = []
+        for r in raw_user:
+            repo_uuid = r.get("uuid", r.get("full_name", ""))
+            if repo_uuid in seen_repo_uuids:
+                continue
+            seen_repo_uuids.add(repo_uuid)
+            ri = _bitbucket_to_repo_info(r, "user")
+            if _should_include(ri, visibility, include_archived, include_forks,
+                               exclude_repos_set):
+                user_repos.append(ri)
+        user_repos.sort(key=lambda x: x.full_name.lower())
+        if user_repos:
+            result["user"] = user_repos
+
+    return result
+
+
+def _bitbucket_to_repo_info(r: dict, workspace: str) -> RepoInfo:
+    """Convert a Bitbucket repository dict to a RepoInfo."""
+    full_name = r.get("full_name", "")
+    ws_slug = (r.get("workspace") or {}).get("slug", workspace)
+    return RepoInfo(
+        full_name=full_name,
+        owner=ws_slug,
+        name=r.get("slug", "") or r.get("name", ""),
+        private=bool(r.get("is_private")),
+        archived=bool(r.get("is_archived", False)),
+        fork=bool(r.get("parent")),
+        default_branch=(r.get("mainbranch") or {}).get("name", "main"),
+        language=r.get("language"),
+        org=workspace,
+        platform="bitbucket",
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Shared filter
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -623,7 +802,12 @@ def _should_include(ri: RepoInfo, visibility: str, include_archived: bool,
 
 def print_inventory(org_repos: Dict[str, List[RepoInfo]], platform: str) -> None:
     total = sum(len(repos) for repos in org_repos.values())
-    scope_label = "group(s)" if platform == "gitlab" else "org(s)/scope(s)"
+    if platform == "gitlab":
+        scope_label = "group(s)"
+    elif platform == "bitbucket":
+        scope_label = "workspace(s)"
+    else:
+        scope_label = "org(s)/scope(s)"
     print(f"\n{'=' * 70}")
     print(f"  📋  REPOSITORY INVENTORY [{platform.upper()}] — {total} repo(s) across "
           f"{len(org_repos)} {scope_label}")
@@ -634,6 +818,8 @@ def print_inventory(org_repos: Dict[str, List[RepoInfo]], platform: str) -> None
             label = "👤 Personal / Owned"
         elif platform == "gitlab":
             label = f"🦊 {org}"
+        elif platform == "bitbucket":
+            label = f"🪣 {org}"
         else:
             label = f"🏢 {org}"
         print(f"  {label}  ({len(repos)} repos)")
@@ -689,9 +875,11 @@ def run_evaluator(
 
     output_file = os.path.join(repo_output_dir, f"{repo_folder}.json")
 
-    # For GitLab, prefix with "gitlab:" so repo_evaluator.py detects the platform
+    # Prefix so repo_evaluator.py detects the platform
     if platform == "gitlab":
         repo_arg = f"gitlab:{repo_full_name}"
+    elif platform == "bitbucket":
+        repo_arg = f"bitbucket:{repo_full_name}"
     else:
         repo_arg = repo_full_name
 
@@ -853,11 +1041,12 @@ Configuration priority (highest wins):
   4. Built-in default
 
 Supported env vars (all optional — CLI args override):
-  GITHUB_TOKEN / GH_TOKEN   GitHub Personal Access Token
-  GITLAB_TOKEN / GL_TOKEN   GitLab Personal Access Token
-  GITLAB_URL                GitLab instance URL (default: https://gitlab.com)
-  OPENAI_API_KEY             Passed through to repo_evaluator.py
-  EVAL_PLATFORM              github / gitlab                → --platform
+  GITHUB_TOKEN / GH_TOKEN       GitHub Personal Access Token
+  GITLAB_TOKEN / GL_TOKEN       GitLab Personal Access Token
+  GITLAB_URL                    GitLab instance URL (default: https://gitlab.com)
+  BITBUCKET_TOKEN / BB_TOKEN    Bitbucket App Password / API token
+  OPENAI_API_KEY                 Passed through to repo_evaluator.py
+  EVAL_PLATFORM                  github / gitlab / bitbucket  → --platform
   EVAL_ORGS                  Comma-separated org/group names → --org
   EVAL_EXCLUDE_ORGS          Comma-separated names           → --exclude-org
   EVAL_EXCLUDE_REPOS         Comma-separated owner/repo      → --exclude-repo
@@ -885,6 +1074,17 @@ How to get a GitLab token:
      (or your self-hosted GitLab → Settings → Access Tokens)
   2. Create a token with scopes: read_api, read_repository
   3. Set GITLAB_TOKEN=glpat-xxx in .env or pass --token glpat-xxx
+
+Examples — Bitbucket:
+  python run_all_repos.py --platform bitbucket --dry-run
+  python run_all_repos.py --platform bitbucket --token <app-password> --dry-run
+  python run_all_repos.py --platform bitbucket --run --org my-workspace
+
+How to get a Bitbucket token:
+  1. Go to https://bitbucket.org/account/settings/app-passwords/
+  2. Create an App Password with scopes: Account (Read), Repositories (Read),
+     Workspace membership (Read)
+  3. Set BITBUCKET_TOKEN=<app-password> in .env or pass --token <app-password>
         """,
     )
 
@@ -897,7 +1097,7 @@ How to get a GitLab token:
     # ── Platform ─────────────────────────────────────────────────────────────
     p.add_argument(
         "--platform",
-        choices=["github", "gitlab"], default=None,
+        choices=["github", "gitlab", "bitbucket"], default=None,
         help="Platform to discover repos from "
              "(env: EVAL_PLATFORM, default: github)",
     )
@@ -908,7 +1108,8 @@ How to get a GitLab token:
         default=None,
         help="Personal Access Token for the chosen platform "
              "(env: GITHUB_TOKEN / GH_TOKEN for GitHub, "
-             "GITLAB_TOKEN / GL_TOKEN for GitLab)",
+             "GITLAB_TOKEN / GL_TOKEN for GitLab, "
+             "BITBUCKET_TOKEN / BB_TOKEN for Bitbucket)",
     )
 
     # ── GitLab-specific ──────────────────────────────────────────────────────
@@ -1071,6 +1272,8 @@ def resolve_config(args: argparse.Namespace) -> ResolvedConfig:
     # Token: pick env var keys based on platform
     if platform == "gitlab":
         token_env_keys = ["GITLAB_TOKEN", "GL_TOKEN"]
+    elif platform == "bitbucket":
+        token_env_keys = ["BITBUCKET_TOKEN", "BB_TOKEN"]
     else:
         token_env_keys = ["GITHUB_TOKEN", "GH_TOKEN"]
 
@@ -1159,7 +1362,12 @@ def print_config(cfg: ResolvedConfig) -> None:
     if cfg.platform == "gitlab":
         rows.append(("GitLab URL", cfg.gitlab_url, cfg.sources.get("gitlab_url", "")))
 
-    org_label = "Groups filter" if cfg.platform == "gitlab" else "Orgs filter"
+    if cfg.platform == "gitlab":
+        org_label = "Groups filter"
+    elif cfg.platform == "bitbucket":
+        org_label = "Workspaces filter"
+    else:
+        org_label = "Orgs filter"
     rows += [
         (org_label, ", ".join(cfg.orgs) if cfg.orgs else "(all)", cfg.sources.get("orgs", "")),
         ("Exclude orgs/groups", ", ".join(cfg.exclude_orgs) if cfg.exclude_orgs else "(none)", cfg.sources.get("exclude_orgs", "")),
@@ -1206,6 +1414,20 @@ def main() -> int:
                 "     → Required scopes: read_api, read_repository\n",
                 file=sys.stderr,
             )
+        elif cfg.platform == "bitbucket":
+            print(
+                "❌ ERROR: No Bitbucket token provided.\n"
+                "   Set it via any of these (highest priority first):\n"
+                "     1. CLI arg:    --token <app-password>\n"
+                "     2. Env var:    export BITBUCKET_TOKEN=<app-password>\n"
+                "     3. .env file:  BITBUCKET_TOKEN=<app-password>\n"
+                "\n"
+                "   How to create a Bitbucket App Password:\n"
+                "     → https://bitbucket.org/account/settings/app-passwords/\n"
+                "     → Required scopes: Account (Read), Repositories (Read),\n"
+                "       Workspace membership (Read)\n",
+                file=sys.stderr,
+            )
         else:
             print(
                 "❌ ERROR: No GitHub token provided.\n"
@@ -1223,6 +1445,8 @@ def main() -> int:
     # ── Platform-specific flow ───────────────────────────────────────────────
     if cfg.platform == "gitlab":
         return _run_gitlab(cfg)
+    elif cfg.platform == "bitbucket":
+        return _run_bitbucket(cfg)
     else:
         return _run_github(cfg)
 
@@ -1284,10 +1508,42 @@ def _run_gitlab(cfg: ResolvedConfig) -> int:
     return _finish(cfg, org_repos)
 
 
+def _run_bitbucket(cfg: ResolvedConfig) -> int:
+    """Bitbucket discovery + evaluation flow."""
+    api = BitbucketAPI(cfg.token)
+    try:
+        user = api.authenticated_user()
+    except Exception as e:
+        print(f"❌ ERROR: Failed to authenticate with Bitbucket — {e}", file=sys.stderr)
+        print("   Possible causes:", file=sys.stderr)
+        print("   • App Password is invalid or expired", file=sys.stderr)
+        print("   • Token doesn't have required read scopes", file=sys.stderr)
+        return 1
+
+    username = user.get("username", user.get("display_name", "unknown"))
+    print(f"🔑 Authenticated as: {username}  (Bitbucket)")
+
+    print("🔍 Discovering workspaces and repositories …\n")
+    org_repos = discover_bitbucket_repos(
+        api,
+        only_workspaces=cfg.orgs,
+        exclude_workspaces=cfg.exclude_orgs,
+        exclude_repos=cfg.exclude_repos,
+        include_user_repos=cfg.include_user_repos,
+        include_archived=cfg.include_archived,
+        include_forks=cfg.include_forks,
+        visibility=cfg.visibility,
+    )
+
+    return _finish(cfg, org_repos)
+
+
 def _finish(cfg: ResolvedConfig, org_repos: Dict[str, List[RepoInfo]]) -> int:
     """Common post-discovery logic: print, save, run."""
     if not org_repos or all(len(v) == 0 for v in org_repos.values()):
-        scope = "groups" if cfg.platform == "gitlab" else "orgs"
+        scope = {"gitlab": "groups", "bitbucket": "workspaces"}.get(
+            cfg.platform, "orgs"
+        )
         print("ℹ️  No repos found.")
         print("   Possible causes:")
         print(f"   • The token doesn't have access to any {scope}")
