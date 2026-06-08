@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 from datetime import datetime
 import logging
+import os
 import re
 import time
 from typing import Callable, Dict, List, Optional
@@ -383,12 +384,31 @@ class GitHubClient(PlatformClient):
 
 
 class BitbucketClient(PlatformClient):
-    def __init__(self, owner: str, repo_name: str, token: Optional[str] = None):
+    def __init__(
+        self,
+        owner: str,
+        repo_name: str,
+        token: Optional[str] = None,
+        username: Optional[str] = None,
+    ):
         super().__init__(owner, repo_name, token)
         self.base_url = "https://api.bitbucket.org/2.0"
-        self.headers = {"Accept": "application/json"}
-        if self.token:
-            self.headers["Authorization"] = f"Bearer {self.token}"
+        self.username = (
+            username
+            or os.getenv("BITBUCKET_USERNAME")
+            or os.getenv("BITBUCKET_EMAIL")
+        )
+        self.session = requests.Session()
+        self.session.headers.update({"Accept": "application/json"})
+        self._configure_auth()
+
+    def _configure_auth(self) -> None:
+        if not self.token:
+            return
+        if self.username:
+            self.session.auth = (self.username, self.token)
+        else:
+            self.session.auth = ("x-bitbucket-api-token-auth", self.token)
 
     def fetch_prs(self, cursor: Optional[str] = None, page_size: int = 50, start_date: Optional[datetime] = None) -> dict:
         if cursor and cursor.startswith("http"):
@@ -403,7 +423,7 @@ class BitbucketClient(PlatformClient):
                 params["q"] = f"created_on>={start_date.isoformat()}"
 
         def _make_request():
-            response = requests.get(request_url, headers=self.headers, params=params, timeout=30)
+            response = self.session.get(request_url, params=params, timeout=30)
             response.raise_for_status()
             return response.json()
 
@@ -415,7 +435,7 @@ class BitbucketClient(PlatformClient):
             if files_url:
                 try:
                     def _get_files():
-                        files_response = requests.get(files_url, headers=self.headers, timeout=30)
+                        files_response = self.session.get(files_url, timeout=30)
                         files_response.raise_for_status()
                         return files_response.json()
 
@@ -490,7 +510,7 @@ class BitbucketClient(PlatformClient):
             url = f"{self.base_url}/repositories/{self.owner}/{self.repo_name}/issues/{issue_number}"
 
             def _make_request():
-                response = requests.get(url, headers=self.headers, timeout=30)
+                response = self.session.get(url, timeout=30)
                 response.raise_for_status()
                 return response.json()
 
@@ -533,7 +553,7 @@ class BitbucketClient(PlatformClient):
             url = f"{self.base_url}/repositories/{self.owner}/{self.repo_name}"
 
             def _make_request():
-                response = requests.get(url, headers=self.headers, timeout=30)
+                response = self.session.get(url, timeout=30)
                 response.raise_for_status()
                 return response.json()
 
@@ -550,9 +570,8 @@ class BitbucketClient(PlatformClient):
 
             def _count(state_query: str) -> int:
                 def _make_request():
-                    response = requests.get(
+                    response = self.session.get(
                         base,
-                        headers=self.headers,
                         params={"q": state_query, "pagelen": 1},
                         timeout=30,
                     )
@@ -573,7 +592,7 @@ class BitbucketClient(PlatformClient):
             url = f"{self.base_url}/repositories/{self.owner}/{self.repo_name}/diff/{base_commit}..{head_commit}"
 
             def _make_request():
-                response = requests.get(url, headers=self.headers, timeout=30)
+                response = self.session.get(url, timeout=30)
                 response.raise_for_status()
                 return response.text
 

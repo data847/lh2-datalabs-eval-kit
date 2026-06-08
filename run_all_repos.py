@@ -45,6 +45,7 @@ Supported environment variables
   GITLAB_TOKEN          GitLab Personal Access Token  (or GL_TOKEN)
   GITLAB_URL            GitLab instance URL            (default: https://gitlab.com)
   BITBUCKET_TOKEN       Bitbucket App Password / API token  (or BB_TOKEN)
+  BITBUCKET_USERNAME    Bitbucket username for Basic auth   (or BITBUCKET_EMAIL)
   OPENAI_API_KEY        OpenAI key — passed through to repo_evaluator.py
   EVAL_PLATFORM         "github" | "gitlab" | "bitbucket"  (--platform)
   EVAL_ORGS             Comma-separated org/group list (--org)
@@ -389,15 +390,66 @@ BITBUCKET_API_BASE = "https://api.bitbucket.org/2.0"
 
 
 class BitbucketAPI:
-    """Thin wrapper around the Bitbucket Cloud REST API v2 with pagination."""
+    """Thin wrapper around the Bitbucket Cloud REST API v2 with pagination.
 
-    def __init__(self, token: str) -> None:
+    Supports Bitbucket auth modes:
+      • App password / API token  → HTTP Basic (username:token)
+        - App password: use your Bitbucket username
+        - API token: use your Atlassian account email
+      • OAuth access token      → Authorization: Bearer
+    """
+
+    def __init__(self, token: str, username: Optional[str] = None) -> None:
+        self.token = token
+        self.username = username
         self.session = requests.Session()
         self.session.headers.update({
             "Accept": "application/json",
-            "Authorization": f"Bearer {token}",
             "User-Agent": "run-all-repos",
         })
+        self._auth_mode = ""
+
+    def _apply_bearer(self) -> None:
+        self.session.auth = None
+        self.session.headers["Authorization"] = f"Bearer {self.token}"
+        self._auth_mode = "bearer"
+
+    def _apply_basic(self, user: str) -> None:
+        self.session.headers.pop("Authorization", None)
+        self.session.auth = (user, self.token)
+        self._auth_mode = f"basic:{user}"
+
+    def authenticate(self) -> dict:
+        """Verify credentials and return the /user payload."""
+        attempts: List[tuple] = []
+        if self.username:
+            attempts.append(("basic", self.username))
+        else:
+            attempts.extend([
+                ("bearer", None),
+                ("basic", "x-bitbucket-api-token-auth"),
+            ])
+
+        last_error: Optional[Exception] = None
+        for mode, user in attempts:
+            if mode == "bearer":
+                self._apply_bearer()
+            else:
+                self._apply_basic(user or "")
+            try:
+                resp = self._request("GET", f"{BITBUCKET_API_BASE}/user")
+                resp.raise_for_status()
+                return resp.json()
+            except Exception as e:
+                last_error = e
+
+        raise RuntimeError(
+            "Could not authenticate with Bitbucket.\n"
+            "   Tried Bearer and Basic auth.\n"
+            "   For app passwords, pass --bitbucket-username <bitbucket_username>.\n"
+            "   For API tokens, pass --bitbucket-username <atlassian_email>.\n"
+            f"   Last error: {last_error}"
+        )
 
     def _request(self, method: str, url: str, **kw) -> requests.Response:
         resp = self.session.request(method, url, timeout=60, **kw)
@@ -424,9 +476,7 @@ class BitbucketAPI:
         return results
 
     def authenticated_user(self) -> dict:
-        resp = self._request("GET", f"{BITBUCKET_API_BASE}/user")
-        resp.raise_for_status()
-        return resp.json()
+        return self.authenticate()
 
     def list_workspaces(self) -> List[dict]:
         """Return workspaces the authenticated user is a member of."""
@@ -1044,8 +1094,9 @@ Supported env vars (all optional — CLI args override):
   GITHUB_TOKEN / GH_TOKEN       GitHub Personal Access Token
   GITLAB_TOKEN / GL_TOKEN       GitLab Personal Access Token
   GITLAB_URL                    GitLab instance URL (default: https://gitlab.com)
-  BITBUCKET_TOKEN / BB_TOKEN    Bitbucket App Password / API token
-  OPENAI_API_KEY                 Passed through to repo_evaluator.py
+  BITBUCKET_TOKEN / BB_TOKEN        Bitbucket App Password / API token
+  BITBUCKET_USERNAME / BITBUCKET_EMAIL  Username or email for Basic auth
+  OPENAI_API_KEY                     Passed through to repo_evaluator.py
   EVAL_PLATFORM                  github / gitlab / bitbucket  → --platform
   EVAL_ORGS                  Comma-separated org/group names → --org
   EVAL_EXCLUDE_ORGS          Comma-separated names           → --exclude-org
@@ -1085,6 +1136,9 @@ How to get a Bitbucket token:
   2. Create an App Password with scopes: Account (Read), Repositories (Read),
      Workspace membership (Read)
   3. Set BITBUCKET_TOKEN=<app-password> in .env or pass --token <app-password>
+  4. For app passwords / API tokens, also set BITBUCKET_USERNAME or pass
+     --bitbucket-username (Bitbucket username for app passwords, Atlassian
+     email for API tokens)
         """,
     )
 
@@ -1117,6 +1171,13 @@ How to get a Bitbucket token:
         "--gitlab-url", default=None,
         help="GitLab instance URL for self-hosted "
              "(env: GITLAB_URL, default: https://gitlab.com)",
+    )
+
+    # ── Bitbucket-specific ───────────────────────────────────────────────────
+    p.add_argument(
+        "--bitbucket-username", default=None,
+        help="Bitbucket username (app password) or Atlassian email (API token) "
+             "(env: BITBUCKET_USERNAME / BITBUCKET_EMAIL)",
     )
 
     # ── Filtering ────────────────────────────────────────────────────────────
@@ -1206,6 +1267,7 @@ class ResolvedConfig:
     platform: str
     token: str
     gitlab_url: str
+    bitbucket_username: str
     orgs: Optional[List[str]]
     exclude_orgs: List[str]
     exclude_repos: List[str]
@@ -1283,6 +1345,9 @@ def resolve_config(args: argparse.Namespace) -> ResolvedConfig:
     gitlab_url, sources["gitlab_url"] = _resolve(
         args.gitlab_url, "GITLAB_URL", "https://gitlab.com")
 
+    bitbucket_username, sources["bitbucket_username"] = _resolve(
+        args.bitbucket_username, "", "", env_keys=["BITBUCKET_USERNAME", "BITBUCKET_EMAIL"])
+
     orgs, sources["orgs"] = _resolve(
         args.org, "EVAL_ORGS", None, is_list=True)
 
@@ -1323,6 +1388,7 @@ def resolve_config(args: argparse.Namespace) -> ResolvedConfig:
         platform=platform,
         token=token,
         gitlab_url=gitlab_url,
+        bitbucket_username=bitbucket_username,
         orgs=orgs if orgs else None,
         exclude_orgs=exclude_orgs or [],
         exclude_repos=exclude_repos or [],
@@ -1361,6 +1427,13 @@ def print_config(cfg: ResolvedConfig) -> None:
 
     if cfg.platform == "gitlab":
         rows.append(("GitLab URL", cfg.gitlab_url, cfg.sources.get("gitlab_url", "")))
+
+    if cfg.platform == "bitbucket":
+        rows.append((
+            "Bitbucket username/email",
+            cfg.bitbucket_username or "(auto-detect)",
+            cfg.sources.get("bitbucket_username", ""),
+        ))
 
     if cfg.platform == "gitlab":
         org_label = "Groups filter"
@@ -1510,7 +1583,7 @@ def _run_gitlab(cfg: ResolvedConfig) -> int:
 
 def _run_bitbucket(cfg: ResolvedConfig) -> int:
     """Bitbucket discovery + evaluation flow."""
-    api = BitbucketAPI(cfg.token)
+    api = BitbucketAPI(cfg.token, username=cfg.bitbucket_username or None)
     try:
         user = api.authenticated_user()
     except Exception as e:
@@ -1518,6 +1591,8 @@ def _run_bitbucket(cfg: ResolvedConfig) -> int:
         print("   Possible causes:", file=sys.stderr)
         print("   • App Password is invalid or expired", file=sys.stderr)
         print("   • Token doesn't have required read scopes", file=sys.stderr)
+        print("   • App passwords need --bitbucket-username <bitbucket_username>", file=sys.stderr)
+        print("   • API tokens need --bitbucket-username <atlassian_email>", file=sys.stderr)
         return 1
 
     username = user.get("username", user.get("display_name", "unknown"))
