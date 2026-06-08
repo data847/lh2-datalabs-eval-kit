@@ -1,6 +1,6 @@
 # LH2 Datalabs Eval Kit
 
-A comprehensive toolkit for evaluating the quality, health, and suitability of GitHub and GitLab repositories. Analyze a **single repository** or **all repositories** across every organization/group your token has access to — in one command.
+A comprehensive toolkit for evaluating the quality, health, and suitability of GitHub, GitLab, and Bitbucket repositories. Analyze a **single repository** or **all repositories** across every organization/group/workspace your token has access to — in one command.
 
 ---
 
@@ -12,6 +12,7 @@ A comprehensive toolkit for evaluating the quality, health, and suitability of G
 - [Creating Access Tokens](#creating-access-tokens)
   - [GitHub Token](#github-token)
   - [GitLab Token](#gitlab-token)
+  - [Bitbucket Token](#bitbucket-token)
 - [Configuration (.env File)](#configuration-env-file)
 - [Script 1: `repo_evaluator.py` — Evaluate a Single Repository](#script-1-repo_evaluatorpy--evaluate-a-single-repository)
   - [What It Does](#what-it-does)
@@ -42,7 +43,7 @@ A comprehensive toolkit for evaluating the quality, health, and suitability of G
 | Script | Purpose |
 | --- | --- |
 | **`repo_evaluator.py`** | Deep-dive evaluation of a **single** repository (repo metrics, PR analysis, F2P tests, quality checks, taxonomy classification). |
-| **`run_all_repos.py`** | Discovers **all** organizations/groups and repos your token can see, then runs `repo_evaluator.py` on each one in parallel. |
+| **`run_all_repos.py`** | Discovers **all** organizations/groups/workspaces and repos your token can see, then runs `repo_evaluator.py` on each one in parallel. |
 
 Think of `run_all_repos.py` as the **orchestrator** and `repo_evaluator.py` as the **worker**.
 
@@ -52,7 +53,7 @@ Think of `run_all_repos.py` as the **orchestrator** and `repo_evaluator.py` as t
 
 - **Python 3.10+**
 - **Git** installed and available on your `$PATH`
-- A **Personal Access Token** for GitHub or GitLab (see [Creating Access Tokens](#creating-access-tokens))
+- A **Personal Access Token** for GitHub, GitLab, or Bitbucket (see [Creating Access Tokens](#creating-access-tokens))
 - *(Optional)* An **OpenAI API key** if you want LLM-powered quality checks, PR rubrics, and taxonomy classification
 
 ---
@@ -95,6 +96,19 @@ pip install -r requirements.txt
    - ✅ `read_user` *(recommended)*
 3. Copy the token — it starts with `glpat-`.
 
+### Bitbucket Token
+
+Bitbucket Cloud supports **App Passwords** (legacy) and **API tokens** (recommended). Both use HTTP Basic auth.
+
+1. Go to **[Bitbucket → Personal settings → App passwords](https://bitbucket.org/account/settings/app-passwords/)** (app password) or create an **API token** from your Atlassian account.
+2. Required scopes:
+   - ✅ Account (Read)
+   - ✅ Repositories (Read)
+   - ✅ Workspace membership (Read)
+3. You also need your **Bitbucket username** (app passwords) or **Atlassian account email** (API tokens) for Basic auth.
+
+> **Auth note:** App passwords use `BITBUCKET_USERNAME=<bitbucket_username>`. API tokens use `BITBUCKET_EMAIL=<your-atlassian-email>` (or `BITBUCKET_USERNAME` with the same email).
+
 ---
 
 ## Configuration (.env File)
@@ -105,9 +119,15 @@ Create a `.env` file in the project root to avoid passing tokens on every comman
 # ── Platform Tokens ──────────────────────────────────────
 GITHUB_TOKEN=ghp_YourGitHubTokenHere
 GITLAB_TOKEN=glpat-YourGitLabTokenHere
+BITBUCKET_TOKEN=YourBitbucketAppPasswordOrApiToken
+BITBUCKET_USERNAME=your-bitbucket-username   # app passwords
+# BITBUCKET_EMAIL=you@example.com            # API tokens
 
 # ── GitLab self-hosted (optional) ────────────────────────
 # GITLAB_URL=https://gitlab.mycompany.com
+
+# ── run_all_repos platform (optional) ────────────────────
+# EVAL_PLATFORM=bitbucket
 
 # ── OpenAI (optional — for LLM quality checks) ──────────
 # OPENAI_API_KEY=sk-YourOpenAIKeyHere
@@ -248,9 +268,9 @@ pr_analysis.pass_first_filter_rate   — Acceptance rate (0.0–1.0)
 
 ### What It Does
 
-1. **Authenticates** with GitHub or GitLab using your token.
-2. **Discovers** all organizations (GitHub) or groups (GitLab) you belong to.
-3. **Lists** every repository in those organizations/groups.
+1. **Authenticates** with GitHub, GitLab, or Bitbucket using your token.
+2. **Discovers** all organizations (GitHub), groups (GitLab), or workspaces (Bitbucket) you belong to.
+3. **Lists** every repository in those organizations/groups/workspaces.
 4. **Filters** repos by visibility, archived status, forks, and exclusion lists.
 5. Optionally **runs `repo_evaluator.py`** on every discovered repo in parallel.
 
@@ -258,7 +278,7 @@ pr_analysis.pass_first_filter_rate   — Acceptance rate (0.0–1.0)
 
 | Mode | What Happens |
 | --- | --- |
-| `--dry-run` | Lists all orgs/groups and their repos. **No evaluation is performed.** Use this first to see what the tool will evaluate. |
+| `--dry-run` | Lists all orgs/groups/workspaces and their repos. **No evaluation is performed.** Use this first to see what the tool will evaluate. |
 | `--run` | Discovers repos *and* runs `repo_evaluator.py` on each one. |
 
 ### Usage
@@ -275,12 +295,13 @@ python run_all_repos.py --run    [OPTIONS]    # Execute mode
 | `--dry-run` | List repos only — do not evaluate | *(required, or `--run`)* |
 | `--run` | Discover and evaluate all repos | *(required, or `--dry-run`)* |
 | **Platform & Auth** | | |
-| `--platform` | `github` or `gitlab` | `github` |
+| `--platform` | `github`, `gitlab`, or `bitbucket` | `github` |
 | `--token` | Personal Access Token | env var |
 | `--gitlab-url` | GitLab instance URL (self-hosted) | `https://gitlab.com` |
+| `--bitbucket-username` | Bitbucket username (app password) or Atlassian email (API token) | env var |
 | **Filtering** | | |
-| `--org` | Only include these org(s)/group(s) — repeatable | all orgs |
-| `--exclude-org` | Exclude org(s)/group(s) — repeatable | none |
+| `--org` | Only include these org(s)/group(s)/workspace(s) — repeatable | all orgs |
+| `--exclude-org` | Exclude org(s)/group(s)/workspace(s) — repeatable | none |
 | `--exclude-repo` | Exclude repos by `owner/repo` — repeatable | none |
 | `--include-user-repos` | Also include personal/owned repos | `False` |
 | `--include-archived` | Include archived repos | `False` |
@@ -304,6 +325,8 @@ All CLI arguments have corresponding environment variables. This is useful for C
 | `GITHUB_TOKEN` / `GH_TOKEN` | `--token` (GitHub) | `ghp_xxx` |
 | `GITLAB_TOKEN` / `GL_TOKEN` | `--token` (GitLab) | `glpat-xxx` |
 | `GITLAB_URL` | `--gitlab-url` | `https://gitlab.mycompany.com` |
+| `BITBUCKET_TOKEN` / `BB_TOKEN` | `--token` (Bitbucket) | app password or API token |
+| `BITBUCKET_USERNAME` / `BITBUCKET_EMAIL` | `--bitbucket-username` | `my-user` or `you@example.com` |
 | `OPENAI_API_KEY` | Passed through to evaluator | `sk-xxx` |
 | `EVAL_PLATFORM` | `--platform` | `github` |
 | `EVAL_ORGS` | `--org` | `my-org,other-org` |
@@ -359,11 +382,30 @@ python run_all_repos.py --platform gitlab --run --org my-group
 python run_all_repos.py --platform gitlab --run \
   --gitlab-url https://gitlab.mycompany.com \
   --token glpat-xxx
+
+# ── Bitbucket ───────────────────────────────────────────
+
+# Preview all Bitbucket workspaces and repos
+python run_all_repos.py --platform bitbucket --dry-run \
+  --token <app-password-or-api-token> \
+  --bitbucket-username <username-or-email>
+
+# Evaluate all repos in one workspace
+python run_all_repos.py --platform bitbucket --run \
+  --org my-workspace \
+  --workers 8
+
+# Using .env (recommended)
+# BITBUCKET_TOKEN=...
+# BITBUCKET_USERNAME=...
+# EVAL_PLATFORM=bitbucket
+python run_all_repos.py --dry-run
+python run_all_repos.py --run --org my-workspace
 ```
 
 ### Output Structure
 
-When run with `--run`, the output is organized by org/group and repo:
+When run with `--run`, the output is organized by org/group/workspace and repo:
 
 ```
 eval_results/                         ← --output-dir (default: eval_results)
@@ -543,6 +585,17 @@ Set your token via **any** of these (highest priority first):
 
 ### GitLab: "insufficient_granular_scope"
 Your token needs these scopes: `read_user`, `read_api`, `read_repository`. Recreate your token at [GitLab → Access Tokens](https://gitlab.com/-/user_settings/personal_access_tokens).
+
+### Bitbucket: "Failed to authenticate" or 401 errors
+- App passwords and API tokens require **Basic auth**, not Bearer-only.
+- Set `BITBUCKET_USERNAME` to your **Bitbucket username** (app password) or `BITBUCKET_EMAIL` to your **Atlassian account email** (API token).
+- Pass `--bitbucket-username` on the CLI if not using `.env`.
+- Ensure the token has **Account (Read)**, **Repositories (Read)**, and **Workspace membership (Read)** scopes.
+
+### Bitbucket: "No repos found"
+- Your token may only have access to specific workspaces — try `--org <workspace-slug>`.
+- Use `--include-user-repos` to include personal/member repos outside workspaces.
+- Confirm you are a **member** of the workspace, not just viewing public repos.
 
 ### Slow evaluations
 Speed things up by skipping optional heavy steps:
